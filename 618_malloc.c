@@ -19,9 +19,9 @@ static processor_heap_t *proc_heap = NULL;
  * time activity. And unless init is complete, no thread can proceedc */
 pthread_mutex_t init_lock;
 
-int initialized = false;
-
-descriptor_t *desc_avail = NULL;
+static int initialized = false;
+static int32_t num_processors = 0;
+static descriptor_t *desc_avail = NULL;
 static uint32_t desc_avail_count = 0;
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
@@ -33,7 +33,6 @@ static uint32_t desc_avail_count = 0;
 void init(void)
 {
     int loop_cnt = 0;
-    int32_t num_processors = 0;
 
     pthread_mutex_lock(&init_lock);
     if(!initialized)
@@ -145,10 +144,12 @@ void update_active(int8_t proc_heap_index, descriptor_t *desc, int morecredits)
 {
     active_t *new_active = desc;
     anchor_t new_anchor, old_anchor;
+    uint64_t count = 0;
 
-    new_active &= 0xFFFFFFFFFFFFFFC0;
-    new_active |= morecredits - 1;
-    if(__sync_bool_compare_and_swap(&proc_heap[proc_heap_index]->active, NULL, new_active))
+    new_active = (active_t*)((uint64_t)new_active & 0xFFFFFFFFFFFFFFC0);
+    new_active = (active_t *)((uint64_t)new_active |(morecredits - 1));
+
+    if(__sync_bool_compare_and_swap(&proc_heap[proc_heap_index].active, NULL, new_active))
     {
         return;
     }
@@ -157,9 +158,13 @@ void update_active(int8_t proc_heap_index, descriptor_t *desc, int morecredits)
     while(1)
     {
         new_anchor = old_anchor = desc->anchor;
-        new_anchor.count  += morecredits;
-        new_anchor.state = PARTIAL;
+
+        count = GET_ANCHOR_COUNT(new_anchor);
+        count += count+morecredits;
+        new_anchor = SET_ANCHOR_COUNT(new_anchor, count);
         
+        new_anchor = SET_ANCHOR_STATE(new_anchor,(uint64_t)PARTIAL);
+
         if(__sync_bool_compare_and_swap(&desc->anchor, old_anchor, new_anchor))
         {
             break;
@@ -198,7 +203,10 @@ descriptor_t *desc_alloc()
         {
             int count = desc_avail_count;
             descriptor_t *next = desc->next;
-            
+
+            /* FIXME: This won't work... Need to put this in an atomic block. 
+             * Addresses are 64 bit!!! ADITYA -----------
+             * Use atomic - AVR */
             /* for the sake of a double CAS */
             uint64_t old = (uint64_t)desc;
             old = old << 32;
@@ -217,7 +225,7 @@ descriptor_t *desc_alloc()
         {
             /* Request for a superblock for descriptors */
             size_t total_proc_heaps = num_processors * NUM_SIZE_CLASS; //NUM_SIZE_CLASS heaps for each processor
-            desc = alloc_new_superblk(sizeof(descriptor_t), total_proc_heap, ADDRESS);       //FIXME: Is this size fit?
+            desc = alloc_new_superblk(sizeof(descriptor_t), total_proc_heaps, ADDRESS);       //FIXME: Is this size fit?
             if(desc == NULL)
             {
                 /* Failed to allocate memory */
@@ -235,9 +243,9 @@ descriptor_t *desc_alloc()
                  * Return this SB to the OS. FIXME: Is this
                  * how we return? FIXME FIXME FIXME */
                 void *current = sbrk(0);
-                if(FAILURE != brk(desc+(sizeof(descriptor_t)*total_proc_heap)))
+                if(FAILURE != brk(desc+(sizeof(descriptor_t)*total_proc_heaps)))
                 {
-                    sbrk(0 - (sizeof(descriptor_t)*total_proc_heap));
+                    sbrk(0 - (sizeof(descriptor_t)*total_proc_heaps));
                     brk(current);
                 }
             }
@@ -255,7 +263,7 @@ descriptor_t *list_get_partial(sizeclass_t *size_class)
         desc_list_t new_list = size_class->partial;
         desc_list_t old_list = size_class->partial;
     
-        desc = new_list->partial.head;
+        desc = new_list.head;
 
         new_list.head = old_list.head->next;
         new_list.tag++;
@@ -278,11 +286,11 @@ descriptor_t *list_put_partial(sizeclass_t *size_class, descriptor_t *desc)
         desc_list_t old_list = size_class->partial;
 
         /* Try to update tail->next first */
-        if(old_list->tail->next == NULL)
+        if(old_list.tail->next == NULL)
         {
             while(1)
             {
-                if(__sync_bool_compare_and_swap(&old_list->tail->next, NULL, desc))
+                if(__sync_bool_compare_and_swap(&old_list.tail->next, NULL, desc))
                 {
                     break;   
                 }
@@ -304,14 +312,14 @@ descriptor_t *heap_get_partial(int8_t proc_heap_index)
 
     while(1)
     {
-        desc = proc_heap[proc_heap_index]->partial;
+        desc = proc_heap[proc_heap_index].partial;
         if(desc == NULL)
         {
             /* FIXME: WTF is list get partial???? ADITYA */
-            return list_get_partial(proc_heap[proc_heap_index]->size_class);
+            return list_get_partial(proc_heap[proc_heap_index].size_class);
         }
 
-        if(__sync_bool_compare_and_swap(&proc_heap[proc_heap_index]->partial, desc, NULL))
+        if(__sync_bool_compare_and_swap(&proc_heap[proc_heap_index].partial, desc, NULL))
         {
             break;
         }
@@ -325,7 +333,8 @@ void *malloc_from_partial(int8_t proc_heap_index)
     descriptor_t *desc = NULL;
     anchor_t new_anchor, old_anchor;
     int32_t morecredits = 0;
-    void *addr = NULL:
+    void *addr = NULL;
+    uint64_t count = 0;
 
 retry:
     desc = heap_get_partial(proc_heap_index);
@@ -341,18 +350,20 @@ retry:
         /* Reserve blocks */
         new_anchor = old_anchor = desc->anchor;
 
-        if(old_anchor.state == EMPTY)
+        if(GET_ANCHOR_STATE(old_anchor) == EMPTY)
         {
             desc_retire(desc);
             goto retry;
         }
 
         /* Old anchor state must be PARTIAL and old anchor count must be > 0 */
-        morecredits = min(old_anchor.count - 1, MAXCREDITS);
+        morecredits = min(GET_ANCHOR_COUNT(old_anchor)- 1, MAXCREDITS);
 
-        new_anchor.count -= morecredits + 1;
+        count = GET_ANCHOR_COUNT(new_anchor);
+        count -= morecredits + 1;
+        new_anchor = SET_ANCHOR_COUNT(new_anchor, count);
 
-        new_anchor.state = (morecredits > 0) ? ACTIVE : FULL;
+        new_anchor = SET_ANCHOR_STATE(new_anchor, ((morecredits > 0) ? ACTIVE : FULL));
 
         if(__sync_bool_compare_and_swap(&desc->anchor, old_anchor, new_anchor))
         {
@@ -364,9 +375,14 @@ retry:
     while(1)
     {
         new_anchor = old_anchor = desc->anchor;
-        addr = desc->super_block + old_anchor.avail*desc->block_size;
-        new_anchor.avail = *(unsigned *)addr;
-        new_anchor.tag++;
+        addr = desc->super_block + GET_ANCHOR_AVAIL(old_anchor)*desc->block_size;
+
+        new_anchor = SET_ANCHOR_AVAIL(new_anchor, *(unsigned *)addr);
+        
+        count = GET_ANCHOR_TAG(new_anchor);
+        count++;
+        new_anchor = SET_ANCHOR_TAG(new_anchor, count);
+
         if(__sync_bool_compare_and_swap(&desc->anchor, old_anchor, new_anchor))
         {
             break;
@@ -388,11 +404,14 @@ retry:
 void *malloc_from_active(int8_t proc_heap_index)
 {
     descriptor_t *desc = NULL;
+    void *addr = NULL;
+    uint64_t temp = 0;
+
     while(1)
     {
         /* Reserve a block */
-        active_t new_active = heap->active;
-        active_t old_active = heap->active;
+        active_t new_active = proc_heap[proc_heap_index].active;
+        active_t old_active = proc_heap[proc_heap_index].active;
         
         if(!old_active)
         {
@@ -427,26 +446,30 @@ void *malloc_from_active(int8_t proc_heap_index)
             anchor_t new_anchor = desc->anchor;
             anchor_t old_anchor = desc->anchor;
 
-            addr = desc->super_block + old_anchor.avail * desc->size_class;
+            addr = (void *)desc->super_block + GET_ANCHOR_AVAIL(old_anchor) * desc->size_class;
 
             next = *(unsigned *)addr;
 
-            new_anchor.avail = next;
-            new_anchor.tag++;
+            new_anchor = SET_ANCHOR_AVAIL(new_anchor, next);
+            temp = GET_ANCHOR_TAG(new_anchor);
+            temp++;
+            new_anchor = SET_ANCHOR_TAG(new_anchor, temp);
 
             //if(0 == old_anchor.credits)
             if(0 == (old_active & 0x000000000000003F))
             {
                 /* State must be ACTIVE */
-                if(0 == old_anchor.count)
+                if(0 == GET_ANCHOR_COUNT(old_anchor))
                 {
-                    new_anchor.state = FULL;
+                    new_anchor = SET_ANCHOR_STATE(new_anchor, FULL);
                 }
                 else
                 {
-                    morecredits = min(old_anchor.count, MAXCREDITS);
+                    morecredits = min(GET_ANCHOR_COUNT(old_anchor), MAXCREDITS);
                 }
-                new_anchor.count -=morecredits;
+                temp = GET_ANCHOR_COUNT(new_anchor);
+                temp -= morecredits;
+                new_anchor = SET_ANCHOR_COUNT(new_anchor, temp);
             }
         }
 
@@ -456,7 +479,7 @@ void *malloc_from_active(int8_t proc_heap_index)
         }
     }
 
-    if((0 == (old_active & 0x000000000000003F)) && (old_anchor.count > 0))
+    if((0 == (old_active & 0x000000000000003F)) && (GET_ANCHOR_COUNT(old_anchor) > 0))
     {
         update_active(&proc_heap[proc_heap_index], desc, morecredits);
     }
@@ -479,7 +502,7 @@ void *malloc_from_newsb(int8_t proc_heap_index)
                 (proc_heap[proc_heap_index]->size_class->sb_size/proc_heap[proc_heap_index]->size_class), INDEX); 
 
     desc->heap = &proc_heap[proc_heap_index];
-    desc->anchor.avail = 1;
+    desc->anchor = SET_ANCHOR_AVAIL(desc->anchor.avail, 1);
 
     desc->block_size = proc_heap[proc_heap_index]->size_class->block_size;
     desc->maxcount = proc_heap[proc_heap_index]->size_class->sb_size/desc->block_size;
@@ -487,8 +510,8 @@ void *malloc_from_newsb(int8_t proc_heap_index)
     new_active = desc;
     new_active &= 0xFFFFFFFFFFFFC0;
     new_active |= min(desc->maxcount - 1, MAXCREDITS) - 1;
-    desc->anchor.count = (desc->maxcount - 1) - ((new_active & 0xFFFFFFFFFFFFC0) + 1);
-    desc->anchor.state = ACTIVE;
+    desc->anchor = SET_ANCHOR_COUNT(desc->anchor, (desc->maxcount - 1) - ((new_active & 0xFFFFFFFFFFFFC0) + 1));
+    desc->anchor = SET_ANCHOR_STATE(desc->anchor, ACTIVE);
 
     if(__sync_bool_compare_and_swap(&proc_heap[proc_heap_index].active, NULL, new_active))
     {
