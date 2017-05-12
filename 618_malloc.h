@@ -2,7 +2,12 @@
 #include<stdint.h>
 
 #define NUM_SIZE_CLASS 7
-const int size_classes_avail[] = {4, 8, 16, 32, 64, 128, 512};   //Make sure to update NUM_SIZE_CLASS if updating this.
+const int size_classes_avail[] = {16, 32, 64, 128, 512, 1024, 2048};   //Make sure to update NUM_SIZE_CLASS if updating this.
+#define MAXCREDITS 1 << 6
+#define EIGHTBYTES 8
+
+void *malloc(size_t size);
+void free(void *ptr);
 
 /* Anchor state enum */
 typedef enum
@@ -27,7 +32,7 @@ typedef struct
 }anchor_t;
 #endif
 
-typedef unsigned anchor_t;      //avail:10, count:10, state:2, tag:42
+typedef uint64_t anchor_t;      //avail:10, count:10, state:2, tag:42
 /* Extract anchor data */
 #define GET_ANCHOR_AVAIL(x) (x & 0xFFC0000000000000) >> 54
 #define SET_ANCHOR_AVAIL(x, y) (x & 0x003FFFFFFFFFFFFF) | (y << 54)
